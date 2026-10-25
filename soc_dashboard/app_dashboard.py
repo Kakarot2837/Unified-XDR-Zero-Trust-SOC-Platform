@@ -1,36 +1,33 @@
 # soc_dashboard/app_dashboard.py
 import os
 import sys
+import time
+import wave
+import math
+import struct
 import json
 import sqlite3
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 import streamlit as st
-from datetime import datetime
 
-# Ensure root directory is in sys.path so imports work cleanly on Windows
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT_DIR not in sys.path:
     sys.path.insert(0, ROOT_DIR)
 
-# Replace the old imports in app_dashboard.py with these:
 from core_backend.database.models import (
-    SessionLocal, engine, User, AuthSession, ThreatIndicator,
+    SessionLocal, User, AuthSession, ThreatIndicator,
     SecurityAlert, IncidentResponseAudit, redis_cache
 )
 from core_backend.database.seed_db import init_and_seed_db
-
-# THIS IS THE CRITICAL LINE TO FIX YOUR ERROR:
 from core_backend.correlation_engine import TelemetryEvent, record_and_correlate_alert
-
 from sensors.all_detectors import (
     detect_port_scan, detect_dos_flood, detect_arp_spoofing,
-    detect_sqli, track_brute_force, calculate_haversine_velocity,
-    analyze_keystroke_biometrics, verify_webcam_face_bytes,
-    compute_file_sha256, analyze_vishing_transcript
+    detect_sqli, track_brute_force, analyze_keystroke_biometrics,
+    verify_webcam_face_bytes, compute_file_sha256, analyze_ai_voice_fft
 )
-# Initialize DB & Seed Data on launch
+
 init_and_seed_db()
 
 st.set_page_config(
@@ -46,15 +43,105 @@ def run_sql_df(query: str) -> pd.DataFrame:
     with sqlite3.connect(os.path.join(ROOT_DIR, "xdr_soc.db")) as conn:
         return pd.read_sql_query(query, conn)
 
-# ==========================================
-# SIDEBAR: 1-CLICK RED-TEAM ATTACK SIMULATOR
-# ==========================================
-st.sidebar.title("⚡ Red-Team Simulator")
-st.sidebar.caption("1-Click Demo Triggers for All 10 Modules")
+if "authenticated_gate" not in st.session_state:
+    st.session_state.authenticated_gate = False
+if "failed_login_count" not in st.session_state:
+    st.session_state.failed_login_count = 0
+if "lockout_until" not in st.session_state:
+    st.session_state.lockout_until = 0.0
 
 db = get_db_session()
+
+# ==============================================================================
+# ZERO-TRUST LOGIN GATE + >5 ATTEMPTS 30s SCREEN LOCKOUT + CAMERA THREAT SCANNER
+# ==============================================================================
+if not st.session_state.authenticated_gate:
+    st.title("🔐 Zero-Trust SOC Gatekeeper — Mandatory Authentication")
+    st.caption("Protected by Brute-Force Lockout (>5 Attempts = 30s Screen Lock), SQLi WAF & Live Camera Threat Analysis")
+
+    now_ts = time.time()
+    remaining_lock = int(st.session_state.lockout_until - now_ts)
+
+    if remaining_lock > 0:
+        st.error(f"🚨 **BRUTE-FORCE LOCKOUT TRIGGERED!** Too many failed login attempts (>5). Screen is locked for **{remaining_lock} seconds**!")
+        st.progress(min(remaining_lock / 30.0, 1.0))
+        time.sleep(1)
+        st.rerun()
+
+    col_gate_login, col_gate_cam = st.columns([1.1, 1])
+
+    with col_gate_login:
+        st.subheader("1️⃣ Enter Operator Credentials")
+        gate_user = st.text_input("SOC Username", value="aditya_admin")
+        gate_pass = st.text_input("SOC Password (Default: `kakarot_ultra_secret_123`)", type="password")
+        st.caption(f"Active Failed Attempts: **{st.session_state.failed_login_count} / 5**")
+
+        if st.button("🚀 Authenticate & Open SOC Dashboard", use_container_width=True):
+            sqli_check = detect_sqli(f"{gate_user} {gate_pass}", target_endpoint="/gatekeeper/login")
+            if sqli_check["triggered"]:
+                record_and_correlate_alert(TelemetryEvent(
+                    source_ip="185.220.101.45", module_name=sqli_check["module_name"],
+                    threat_type=sqli_check["threat_type"], severity=sqli_check["severity"],
+                    base_risk_score=sqli_check["base_risk_score"], confidence_score=sqli_check["confidence_score"],
+                    raw_payload=sqli_check["raw_payload"]
+                ), db)
+                st.error(f"🚨 SQL Injection Blocked! Command logged: `{sqli_check['telemetry']['attacker_command_used']}`")
+            elif gate_user == "aditya_admin" and gate_pass == "kakarot_ultra_secret_123":
+                st.session_state.failed_login_count = 0
+                st.session_state.authenticated_gate = True
+                st.success("✅ Authentication Successful! Loading SOC Platform...")
+                st.rerun()
+            else:
+                st.session_state.failed_login_count += 1
+                bf_res = track_brute_force("185.220.101.45", gate_user)
+                if st.session_state.failed_login_count > 5 or bf_res["triggered"]:
+                    st.session_state.lockout_until = time.time() + 30.0
+                    record_and_correlate_alert(TelemetryEvent(
+                        source_ip="185.220.101.45", module_name="BRUTE_FORCE",
+                        threat_type=f"Brute Force Lockout ({st.session_state.failed_login_count} Attempts -> 30s Lock)",
+                        severity="HIGH", base_risk_score=30.0, confidence_score=0.98,
+                        raw_payload=json.dumps({
+                            "source_ip": "185.220.101.45", "target_username": gate_user,
+                            "failed_attempts_count": st.session_state.failed_login_count,
+                            "action_taken": "SCREEN_LOCKED_30_SECONDS"
+                        })
+                    ), db)
+                    st.rerun()
+                else:
+                    st.warning(f"❌ Invalid Credentials! Attempt {st.session_state.failed_login_count}/5 (Locks for 30s after 5 attempts).")
+
+    with col_gate_cam:
+        st.subheader("2️⃣ Live Camera Threat & Shoulder-Surfing Scanner")
+        st.info("Detects: (1) Single Authorized User, (2) Multiple Persons / Shoulder-Surfing Threat, (3) Covered/Dark Lens Spoof, (4) Missing Operator.")
+        gate_cam = st.camera_input("Scan Operator Environment")
+        if gate_cam is not None:
+            cam_res = verify_webcam_face_bytes(gate_cam.getvalue())
+            for note in cam_res["notifications"]:
+                if "THREAT" in note or "ALERT" in note:
+                    st.error(note)
+                else:
+                    st.success(note)
+            st.json(cam_res["telemetry"])
+            if cam_res["triggered"]:
+                record_and_correlate_alert(TelemetryEvent(
+                    source_ip="103.21.125.10", module_name=cam_res["module_name"],
+                    threat_type=cam_res["threat_type"], severity=cam_res["severity"],
+                    base_risk_score=cam_res["base_risk_score"], confidence_score=cam_res["confidence_score"],
+                    raw_payload=cam_res["raw_payload"]
+                ), db)
+
+    db.close()
+    st.stop()
+
+# ==============================================================================
+# MAIN SOC PLATFORM (IMPOSSIBLE TRAVEL COMPLETELY REMOVED)
+# ==============================================================================
 current_session = db.query(AuthSession).filter_by(session_id="sess_pune_01").first()
-current_user = db.query(User).filter_by(username="aditya_admin").first()
+
+st.sidebar.title("⚡ Red-Team & Controls")
+if st.sidebar.button("🔒 Logout (Test Login Gate & 30s Lock)", use_container_width=True):
+    st.session_state.authenticated_gate = False
+    st.rerun()
 
 if st.sidebar.button("🟢 Reset Demo to Clean Baseline", use_container_width=True):
     db.query(IncidentResponseAudit).delete()
@@ -62,466 +149,427 @@ if st.sidebar.button("🟢 Reset Demo to Clean Baseline", use_container_width=Tr
     if current_session:
         current_session.session_risk_score = 10.0
         current_session.session_status = "ACTIVE"
-        current_session.city = "Pune"
-        current_session.country = "India"
-        current_session.latitude = 18.5204
-        current_session.longitude = 73.8567
-        current_session.geo_velocity_kmh = 0.0
         current_session.source_ip = "103.21.125.10"
     redis_cache.blocked_ips.clear()
     redis_cache.store.clear()
     db.commit()
-    st.sidebar.success("Reset to Clean Baseline (Risk: 10, Pune)")
     st.rerun()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("🔥 Trigger Individual Attacks")
+st.sidebar.subheader("🔥 1-Click Attack Triggers")
 
-if st.sidebar.button("1️⃣ Port Scan (Nmap 20 Ports)", use_container_width=True):
+if st.sidebar.button("1️⃣ Port Scan (19 Ports Probed)", use_container_width=True):
     res = {}
-    for p in range(20, 40):
+    for p in [21, 22, 23, 25, 53, 80, 110, 135, 139, 143, 443, 445, 1433, 3306, 3389, 5432, 6379, 8000, 8080]:
         res = detect_port_scan("45.155.205.233", p)
     if res.get("triggered"):
         record_and_correlate_alert(TelemetryEvent(
-            source_ip="45.155.205.233",
-            module_name=res["module_name"],
-            threat_type=res["threat_type"],
-            severity=res["severity"],
-            base_risk_score=res["base_risk_score"],
-            confidence_score=res["confidence_score"],
+            source_ip="45.155.205.233", module_name=res["module_name"],
+            threat_type=res["threat_type"], severity=res["severity"],
+            base_risk_score=res["base_risk_score"], confidence_score=res["confidence_score"],
             raw_payload=res["raw_payload"]
         ), db)
     st.rerun()
 
-if st.sidebar.button("2️⃣ High-Volume DoS Flood (350 PPS)", use_container_width=True):
-    res = detect_dos_flood("198.51.100.77", packet_burst_count=350)
+if st.sidebar.button("2️⃣ High-Volume DoS (380 PPS)", use_container_width=True):
+    res = detect_dos_flood("198.51.100.77", packet_burst_count=380, protocol="UDP/SYN Volumetric Flood")
     if res.get("triggered"):
         record_and_correlate_alert(TelemetryEvent(
-            source_ip="198.51.100.77",
-            module_name=res["module_name"],
-            threat_type=res["threat_type"],
-            severity=res["severity"],
-            base_risk_score=res["base_risk_score"],
-            confidence_score=res["confidence_score"],
+            source_ip="198.51.100.77", module_name=res["module_name"],
+            threat_type=res["threat_type"], severity=res["severity"],
+            base_risk_score=res["base_risk_score"], confidence_score=res["confidence_score"],
             raw_payload=res["raw_payload"]
         ), db)
     st.rerun()
 
-if st.sidebar.button("3️⃣ ARP Spoofing (Fake Gateway MAC)", use_container_width=True):
-    res = detect_arp_spoofing("192.168.1.1", "de:ad:be:ef:99:99")
+if st.sidebar.button("3️⃣ ARP Spoofing (MITM MAC Hijack)", use_container_width=True):
+    res = detect_arp_spoofing("192.168.1.1", "de:ad:be:ef:99:99", "Gratuitous ARP Reply (op=2)")
     if res.get("triggered"):
         record_and_correlate_alert(TelemetryEvent(
-            source_ip="192.168.1.55",
-            module_name=res["module_name"],
-            threat_type=res["threat_type"],
-            severity=res["severity"],
-            base_risk_score=res["base_risk_score"],
-            confidence_score=res["confidence_score"],
+            source_ip="192.168.1.55", module_name=res["module_name"],
+            threat_type=res["threat_type"], severity=res["severity"],
+            base_risk_score=res["base_risk_score"], confidence_score=res["confidence_score"],
             raw_payload=res["raw_payload"]
         ), db)
     st.rerun()
 
-if st.sidebar.button("4️⃣ Brute Force (5 Failed Logins)", use_container_width=True):
+if st.sidebar.button("4️⃣ Brute Force (6 Failed Logins)", use_container_width=True):
     res = {}
-    for _ in range(5):
+    for _ in range(6):
         res = track_brute_force("185.220.101.45", "aditya_admin")
     if res.get("triggered"):
         record_and_correlate_alert(TelemetryEvent(
-            source_ip="185.220.101.45",
-            module_name=res["module_name"],
-            threat_type=res["threat_type"],
-            severity=res["severity"],
-            base_risk_score=res["base_risk_score"],
-            confidence_score=res["confidence_score"],
+            source_ip="185.220.101.45", module_name=res["module_name"],
+            threat_type=res["threat_type"], severity=res["severity"],
+            base_risk_score=res["base_risk_score"], confidence_score=res["confidence_score"],
             raw_payload=res["raw_payload"]
         ), db)
     st.rerun()
 
-if st.sidebar.button("5️⃣ SQL Injection (' OR '1'='1)", use_container_width=True):
-    res = detect_sqli("admin' OR '1'='1 -- DROP TABLE users;")
+if st.sidebar.button("5️⃣ SQL Injection (UNION SELECT)", use_container_width=True):
+    res = detect_sqli("admin' OR '1'='1' UNION SELECT username, password_hash FROM users; --")
     if res.get("triggered"):
         record_and_correlate_alert(TelemetryEvent(
-            source_ip="185.220.101.45",
-            module_name=res["module_name"],
-            threat_type=res["threat_type"],
-            severity=res["severity"],
-            base_risk_score=res["base_risk_score"],
-            confidence_score=res["confidence_score"],
+            source_ip="185.220.101.45", module_name=res["module_name"],
+            threat_type=res["threat_type"], severity=res["severity"],
+            base_risk_score=res["base_risk_score"], confidence_score=res["confidence_score"],
             raw_payload=res["raw_payload"]
         ), db)
     st.rerun()
 
-if st.sidebar.button("6️⃣ Impossible Travel (Pune -> London)", use_container_width=True):
-    res = calculate_haversine_velocity(18.5204, 73.8567, 51.5074, -0.1278, elapsed_hours=0.25)
-    if current_session:
-        current_session.city = "London"
-        current_session.country = "UK"
-        current_session.latitude = 51.5074
-        current_session.longitude = -0.1278
-        current_session.geo_velocity_kmh = res["velocity_kmh"]
-        current_session.source_ip = "185.220.101.45"
-        db.commit()
-    if res.get("triggered"):
-        record_and_correlate_alert(TelemetryEvent(
-            source_ip="185.220.101.45",
-            module_name=res["module_name"],
-            threat_type=res["threat_type"],
-            severity=res["severity"],
-            base_risk_score=res["base_risk_score"],
-            confidence_score=res["confidence_score"],
-            raw_payload=res["raw_payload"]
-        ), db)
-    st.rerun()
-
-if st.sidebar.button("7️⃣ Keystroke Biometric Anomaly", use_container_width=True):
-    res = analyze_keystroke_biometrics([190, 210, 185, 220], [310, 295, 340, 305])
-    if res.get("triggered"):
-        record_and_correlate_alert(TelemetryEvent(
-            source_ip="185.220.101.45",
-            module_name=res["module_name"],
-            threat_type=res["threat_type"],
-            severity=res["severity"],
-            base_risk_score=res["base_risk_score"],
-            confidence_score=res["confidence_score"],
-            raw_payload=res["raw_payload"]
-        ), db)
-    st.rerun()
-
-if st.sidebar.button("8️⃣ Face Auth Spoof / Missing Face", use_container_width=True):
-    record_and_correlate_alert(TelemetryEvent(
-        source_ip="185.220.101.45",
-        module_name="FACE_VERIFICATION",
-        threat_type="Face Verification Failed (No Live Face Detected)",
-        severity="HIGH",
-        base_risk_score=45.0,
-        confidence_score=0.95,
-        raw_payload="OpenCV Haar Cascade detected 0 faces during step-up biometric challenge."
-    ), db)
-    st.rerun()
-
-if st.sidebar.button("9️⃣ Malware SHA-256 File Drop", use_container_width=True):
-    eicar_hash = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f"
-    record_and_correlate_alert(TelemetryEvent(
-        source_ip="103.21.125.10",
-        indicator_value=eicar_hash,
-        module_name="MALWARE_HASH",
-        threat_type="Known Malware Executable Quarantined (EICAR/LockBit)",
-        severity="CRITICAL",
-        base_risk_score=60.0,
-        confidence_score=1.0,
-        raw_payload=f"File invoice_update.exe matched SHA-256 [{eicar_hash[:18]}...]. Quarantined."
-    ), db)
-    st.rerun()
-
-if st.sidebar.button("🔟 AI Vishing Scam Call + IOC Hit", use_container_width=True):
-    scam_text = "Hello this is bank support, your account suspended! Share your OTP and install AnyDesk for remote access immediately."
-    res = analyze_vishing_transcript(scam_text)
-    if res.get("triggered"):
-        record_and_correlate_alert(TelemetryEvent(
-            source_ip="185.220.101.45",
-            indicator_value="secure-bank-otp-verify.com",
-            module_name=res["module_name"],
-            threat_type=res["threat_type"],
-            severity=res["severity"],
-            base_risk_score=res["base_risk_score"],
-            confidence_score=res["confidence_score"],
-            raw_payload=res["raw_payload"]
-        ), db)
-    st.rerun()
-
-# ==========================================
-# MAIN HEADER & LIVE STATUS METRICS
-# ==========================================
+# --- HEADER & METRICS ---
 st.title("🛡️ Unified XDR & Zero-Trust SOC Platform")
-st.caption("10-Module Multi-Layer Threat Detection • Hybrid Relational DBMS • Real-Time Risk Correlation & SOAR")
-
 db.refresh(current_session)
-risk_val = current_session.session_risk_score
+risk_val = min(round(current_session.session_risk_score, 1), 100.0)
 status_val = current_session.session_status
 total_alerts_count = db.query(SecurityAlert).count()
-total_iocs_count = db.query(ThreatIndicator).count()
 
-# Dynamic SOAR Banner
-if status_val == "LOCKED" or risk_val >= 80:
-    st.error(f"🚨 **CRITICAL ZERO-TRUST SOAR ENFORCEMENT ACTIVE:** Session `sess_pune_01` is **LOCKED** (Cumulative Risk: **{risk_val}/100**). Source IP `{current_session.source_ip}` added to Blocklist & Step-Up Biometrics Required!")
-elif status_val == "STEP_UP_REQUIRED" or risk_val >= 40:
-    st.warning(f"⚠️ **ELEVATED SESSION RISK ({risk_val}/100):** Mandatory **Webcam Face Verification Step-Up** triggered for user `aditya_admin`.")
-else:
-    st.success(f"✅ **ZERO-TRUST SESSION HEALTHY ({risk_val}/100):** User `aditya_admin` authenticated from `{current_session.city}, {current_session.country}` ({current_session.source_ip}).")
+m1, m2, m3 = st.columns(3)
+m1.metric("Dynamic Session Risk Score", f"{risk_val} / 100")
+m2.metric("Zero-Trust Session Status", status_val)
+m3.metric("Total Alerts Stored in DB", total_alerts_count)
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Dynamic Session Risk Score", f"{risk_val} / 100", delta="Critical >= 80" if risk_val >= 80 else "Normal < 40", delta_color="inverse")
-m2.metric("Session Enforcement Status", status_val)
-m3.metric("Total Security Alerts (SIEM)", total_alerts_count)
-m4.metric("Geo-Velocity (Last Login Jump)", f"{current_session.geo_velocity_kmh} km/h", delta="Limit: 800 km/h", delta_color="off")
-
-# ==========================================
-# 4 INTERACTIVE TABS
-# ==========================================
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📊 1. Live SOC Overview & Geo-Map",
-    "🔐 2. Zero-Trust Login, Keystroke & Face Portal",
-    "🧪 3. Network, Malware Hash & AI Vishing Sandbox",
-    "🗄️ 4. DBMS Live SQL Explorer (Evaluation View)"
+tab1, tab_true, tab_live, tab2, tab3, tab4 = st.tabs([
+    "📊 1. SOC Overview & SIEM Stream",
+    "🔍 2. True Sensor Telemetry Values",
+    "📡 3. Live Attacker Feed (Auto-Reload)",
+    "📸 4. Camera Threat & Keystroke Biometrics",
+    "🎙️ 5. FFT AI Voice Rec & SHA-256 Malware",
+    "🗄️ 6. DBMS Live SQL Explorer"
 ])
 
-# ------------------------------------------
-# TAB 1: SOC OVERVIEW, RISK GAUGE & MAP
-# ------------------------------------------
+# ------------------------------------------------------------------------------
+# TAB 1: SOC OVERVIEW & SIEM STREAM
+# ------------------------------------------------------------------------------
 with tab1:
-    col_gauge, col_map = st.columns([1, 1.4])
-
-    with col_gauge:
-        st.subheader("🎯 Multi-Signal Session Risk Gauge")
+    c1, c2 = st.columns([1, 1.5])
+    with c1:
         fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=risk_val,
-            domain={'x': [0, 1], 'y': [0, 1]},
-            title={'text': "Session Risk Score (R_total)"},
+            mode="gauge+number", value=risk_val,
+            title={'text': "Unified Session Risk Score (0-100)"},
             gauge={
-                'axis': {'range': [0, 150]},
+                'axis': {'range': [0, 100]},
                 'bar': {'color': "#ef4444" if risk_val >= 80 else "#f59e0b" if risk_val >= 40 else "#10b981"},
-                'steps': [
-                    {'range': [0, 40], 'color': "rgba(16, 185, 129, 0.2)"},
-                    {'range': [40, 80], 'color': "rgba(245, 158, 11, 0.2)"},
-                    {'range': [80, 150], 'color': "rgba(239, 68, 68, 0.25)"}
-                ],
                 'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.8, 'value': 80}
             }
         ))
-        fig_gauge.update_layout(height=320, margin=dict(l=20, r=20, t=40, b=20))
+        fig_gauge.update_layout(height=280, margin=dict(l=20, r=20, t=40, b=20))
         st.plotly_chart(fig_gauge, use_container_width=True)
+    with c2:
+        st.markdown("#### 🚨 Live Enriched SIEM Alert Stream (`security_alerts` + `threat_indicators`)")
+        df_siem = run_sql_df("""
+            SELECT a.alert_id, a.timestamp, a.module_name, a.threat_type, a.severity,
+                   a.source_ip, a.base_risk_score, a.ioc_bonus_score,
+                   COALESCE(t.threat_actor, 'Clean / Unlisted') AS ioc_actor
+            FROM security_alerts a
+            LEFT JOIN threat_indicators t ON a.ioc_id = t.ioc_id
+            ORDER BY a.alert_id DESC LIMIT 15
+        """)
+        st.dataframe(df_siem, use_container_width=True, hide_index=True)
 
-    with col_map:
-        st.subheader("🌍 Geo-Velocity & Impossible Travel Tracker")
-        fig_map = go.Figure()
-        # Baseline Pune Marker
-        fig_map.add_trace(go.Scattergeo(
-            lon=[73.8567, current_session.longitude],
-            lat=[18.5204, current_session.latitude],
-            mode='lines+markers+text',
-            text=["Pune (Baseline)", f"{current_session.city} ({current_session.geo_velocity_kmh} km/h)"],
-            textposition="top center",
-            line=dict(width=3, color="#ef4444" if current_session.geo_velocity_kmh > 800 else "#3b82f6"),
-            marker=dict(size=10, color=["#10b981", "#ef4444" if current_session.geo_velocity_kmh > 800 else "#10b981"])
-        ))
-        fig_map.update_layout(
-            height=320,
-            margin=dict(l=0, r=0, t=10, b=0),
-            geo=dict(projection_type="natural earth", showland=True, landcolor="#1e293b", oceancolor="#0f172a", showocean=True)
-        )
-        st.plotly_chart(fig_map, use_container_width=True)
+# ------------------------------------------------------------------------------
+# TAB 2: TRUE SENSOR TELEMETRY VALUES
+# ------------------------------------------------------------------------------
+with tab_true:
+    st.subheader("🔍 True Software Telemetry Inspector (Stored in Database)")
+    t_col1, t_col2 = st.columns(2)
+    with t_col1:
+        ports_input = st.multiselect("Module 1 (Port Scan): Select Ports to Attack", [21, 22, 23, 25, 53, 80, 110, 139, 443, 445, 1433, 3306, 3389, 5432, 8000, 8080], default=[21, 22, 80, 443, 3306, 3389])
+        if st.button("Run Port Scan & Log True Ports"):
+            res = {}
+            for p in ports_input:
+                res = detect_port_scan("45.155.205.233", p)
+            record_and_correlate_alert(TelemetryEvent(
+                source_ip="45.155.205.233", module_name="PORT_SCAN",
+                threat_type=f"Port Scan ({len(ports_input)} Ports Attacked)", severity="MEDIUM",
+                base_risk_score=30.0, confidence_score=0.95, raw_payload=json.dumps(res["telemetry"])
+            ), db)
+            st.rerun()
 
-    st.subheader("🚨 Live Enriched SIEM Alert Stream (`security_alerts` + `threat_indicators`)")
-    df_alerts = run_sql_df("""
-        SELECT a.alert_id, a.timestamp, a.module_name, a.threat_type, a.severity,
-               a.source_ip, a.base_risk_score, a.ioc_bonus_score,
-               COALESCE(t.threat_actor, 'None') AS ioc_actor, a.raw_payload
+        dos_pps_in = st.slider("Module 2 (DoS Flood): Packets Per Second (PPS)", 50, 1000, 420)
+        if st.button("Run DoS Flood & Log True PPS"):
+            res = detect_dos_flood("198.51.100.77", packet_burst_count=dos_pps_in, protocol="TCP SYN Flood")
+            record_and_correlate_alert(TelemetryEvent(
+                source_ip="198.51.100.77", module_name="DOS_FLOOD",
+                threat_type=f"DoS Flood ({dos_pps_in} PPS)", severity="CRITICAL",
+                base_risk_score=50.0, confidence_score=0.99, raw_payload=json.dumps(res["telemetry"])
+            ), db)
+            st.rerun()
+
+    with t_col2:
+        arp_ip_in = st.selectbox("Module 3 (ARP Spoofing): Target IP", ["192.168.1.1", "192.168.1.10", "10.0.0.1"])
+        arp_mac_in = st.text_input("Attacker Claimed MAC Address", value="de:ad:be:ef:caf:e1")
+        arp_type_in = st.selectbox("ARP Packet Type", ["Gratuitous ARP Reply (op=2)", "Unsolicited ARP Broadcast (op=1)"])
+        if st.button("Run ARP Spoof & Log MAC Binding"):
+            res = detect_arp_spoofing(arp_ip_in, arp_mac_in, arp_type_in)
+            record_and_correlate_alert(TelemetryEvent(
+                source_ip="192.168.1.55", module_name="ARP_SPOOFING",
+                threat_type=f"ARP Spoof ({arp_ip_in} -> {arp_mac_in})", severity="CRITICAL",
+                base_risk_score=55.0, confidence_score=1.0, raw_payload=json.dumps(res["telemetry"])
+            ), db)
+            st.rerun()
+
+        sqli_cmd_in = st.text_input("Module 5 (SQLi): Attacker SQL Command", value="admin' OR 1=1 UNION SELECT table_name FROM information_schema.tables; --")
+        if st.button("Run SQLi & Log Attacker Command"):
+            res = detect_sqli(sqli_cmd_in)
+            record_and_correlate_alert(TelemetryEvent(
+                source_ip="185.220.101.45", module_name="SQL_INJECTION",
+                threat_type="SQL Injection Command Intercepted", severity="HIGH",
+                base_risk_score=45.0, confidence_score=0.98, raw_payload=json.dumps(res["telemetry"])
+            ), db)
+            st.rerun()
+
+    st.markdown("---")
+    alerts_all = db.query(SecurityAlert).order_by(SecurityAlert.alert_id.desc()).all()
+    port_rows, dos_rows, arp_rows, sqli_rows = [], [], [], []
+    for a in alerts_all:
+        raw_str = a.raw_payload.split(" | [")[0]
+        try:
+            data = json.loads(raw_str)
+        except Exception:
+            data = {"raw": raw_str}
+        if a.module_name == "PORT_SCAN":
+            port_rows.append({
+                "Alert ID": a.alert_id, "Timestamp": a.timestamp, "Attacker IP": a.source_ip,
+                "Number of Ports Attacked": data.get("ports_attacked_count", "N/A"),
+                "Exact Ports Attacked": str(data.get("ports_attacked_list", raw_str)),
+                "Services Probed": data.get("services_probed", "TCP Ports")
+            })
+        elif a.module_name == "DOS_FLOOD":
+            dos_rows.append({
+                "Alert ID": a.alert_id, "Timestamp": a.timestamp, "Attacker IP": a.source_ip,
+                "Packets Per Second (PPS)": data.get("packets_per_second", "350"),
+                "Protocol Type": data.get("protocol_vector", "SYN Flood"),
+                "Estimated Bandwidth (Mbps)": data.get("estimated_bandwidth_mbps", "N/A")
+            })
+        elif a.module_name == "ARP_SPOOFING":
+            arp_rows.append({
+                "Alert ID": a.alert_id, "Timestamp": a.timestamp,
+                "Connected IP Address": data.get("target_ip_address", "192.168.1.1"),
+                "Trusted Legit MAC": data.get("trusted_legit_mac", "00:11:22:33:44:55"),
+                "Attacker Spoofed MAC": data.get("attacker_spoofed_mac", raw_str),
+                "ARP Connection Type": data.get("arp_packet_type", "op=2 Reply")
+            })
+        elif a.module_name == "SQL_INJECTION":
+            sqli_rows.append({
+                "Alert ID": a.alert_id, "Timestamp": a.timestamp, "Attacker IP": a.source_ip,
+                "Exact SQL Command Used": data.get("attacker_command_used", raw_str),
+                "Matched Signatures": str(data.get("matched_sqli_signatures", "")),
+                "Classification": data.get("sqli_attack_classification", "SQLi")
+            })
+
+    st.markdown("**1️⃣ Port Scanning True Telemetry (Number of Ports & Exact Ports Attacked)**")
+    st.dataframe(pd.DataFrame(port_rows) if port_rows else pd.DataFrame([{"Info": "Trigger Port Scan to see live port numbers."}]), use_container_width=True, hide_index=True)
+
+    st.markdown("**2️⃣ High-Volume DoS True Telemetry (Packets Per Second Used)**")
+    st.dataframe(pd.DataFrame(dos_rows) if dos_rows else pd.DataFrame([{"Info": "Trigger DoS Flood to see live PPS counts."}]), use_container_width=True, hide_index=True)
+
+    st.markdown("**3️⃣ ARP Spoofing True Telemetry (IP Address -> MAC Binding & Type)**")
+    st.dataframe(pd.DataFrame(arp_rows) if arp_rows else pd.DataFrame([{"Info": "Trigger ARP Spoofing to see IP-to-MAC table."}]), use_container_width=True, hide_index=True)
+
+    st.markdown("**4️⃣ SQL Injection True Telemetry (Exact Commands Used by Attacker)**")
+    st.dataframe(pd.DataFrame(sqli_rows) if sqli_rows else pd.DataFrame([{"Info": "Trigger SQLi to see intercepted attacker SQL commands."}]), use_container_width=True, hide_index=True)
+
+# ------------------------------------------------------------------------------
+# TAB 3: LIVE RECORD OF ATTACKER (AUTO-RELOAD)
+# ------------------------------------------------------------------------------
+with tab_live:
+    st.subheader("📡 Live Attacker Intelligence & Real-Time Reload Feed")
+    auto_reload = st.checkbox("🔄 Enable Live Auto-Reload (Refreshes Every 3 Seconds)", value=False)
+    if st.button("🔄 Reload Attacker Feed Now"):
+        st.rerun()
+
+    df_attackers = run_sql_df("""
+        SELECT 
+            a.alert_id AS [Record ID],
+            a.timestamp AS [Attack Timestamp],
+            a.source_ip AS [Attacker IP],
+            COALESCE(t.threat_actor, 'Unknown / Unlisted Actor') AS [Identified Threat Actor],
+            a.module_name AS [Detection Module],
+            a.threat_type AS [Attack Summary],
+            a.severity AS [Severity],
+            (a.base_risk_score + a.ioc_bonus_score) AS [Total Risk Impact],
+            a.raw_payload AS [True Telemetry JSON]
         FROM security_alerts a
         LEFT JOIN threat_indicators t ON a.ioc_id = t.ioc_id
-        ORDER BY a.alert_id DESC LIMIT 25
+        ORDER BY a.alert_id DESC
     """)
-    st.dataframe(df_alerts, use_container_width=True, hide_index=True)
+    st.dataframe(df_attackers, use_container_width=True, hide_index=True)
 
-# ------------------------------------------
-# TAB 2: ZERO-TRUST LOGIN, KEYSTROKE & FACE
-# ------------------------------------------
+    if auto_reload:
+        time.sleep(3)
+        st.rerun()
+
+# ------------------------------------------------------------------------------
+# TAB 4: CAMERA THREAT & KEYSTROKE BIOMETRICS
+# ------------------------------------------------------------------------------
 with tab2:
-    st.subheader("🔐 Interactive Zero-Trust Login & Biometric Verification")
-    c_login, c_bio = st.columns(2)
-
-    with c_login:
-        st.markdown("#### 1. Login & Keystroke Rhythm Simulator")
-        u_in = st.text_input("Username (Try SQLi: `admin' OR '1'='1`)", value="aditya_admin")
-        p_in = st.text_input("Password (Correct: `kakarot_ultra_secret_123`)", value="kakarot_ultra_secret_123", type="password")
-        loc_choice = st.selectbox("Simulated Login Location (GeoIP)", [
-            "Pune, India (103.21.125.10) — Normal Baseline",
-            "London, UK / Tor Exit Node (185.220.101.45) — Impossible Travel + IOC Hit",
-            "Pyongyang, NK Scanner (45.155.205.233) — Impossible Travel + APT IOC"
+    col_ks, col_cam = st.columns(2)
+    with col_ks:
+        st.subheader("⌨️ Keystroke Behavioral Biometrics")
+        rhythm_choice = st.radio("Select Typing Cadence Profile:", [
+            "Authorized Owner Rhythm (Dwell ~85ms, Flight ~120ms)",
+            "Intruder / Hesitant Rhythm (Dwell ~195ms, Flight ~310ms -> Triggers Anomaly)"
         ])
-        typing_style = st.radio("Simulated Keystroke Typing Rhythm", [
-            "Natural Owner Rhythm (Dwell ~85ms, Flight ~120ms)",
-            "Slow/Hesitant Attacker Rhythm (Dwell ~195ms, Flight ~310ms -> Triggers Anomaly)"
-        ])
-
-        if st.button("🚀 Submit Zero-Trust Login Attempt", use_container_width=True):
-            # 1. Check SQLi
-            sqli_res = detect_sqli(f"{u_in} {p_in}")
-            if sqli_res["triggered"]:
+        if st.button("🔍 Verify Keystroke Biometrics"):
+            if "Intruder" in rhythm_choice:
+                k_res = analyze_keystroke_biometrics([190, 200, 195], [305, 315, 310])
                 record_and_correlate_alert(TelemetryEvent(
-                    source_ip="185.220.101.45",
-                    module_name=sqli_res["module_name"],
-                    threat_type=sqli_res["threat_type"],
-                    severity=sqli_res["severity"],
-                    base_risk_score=sqli_res["base_risk_score"],
-                    confidence_score=sqli_res["confidence_score"],
-                    raw_payload=sqli_res["raw_payload"]
+                    source_ip="185.220.101.45", module_name="KEYSTROKE_BIOMETRICS",
+                    threat_type=k_res["threat_type"], severity="MEDIUM",
+                    base_risk_score=35.0, confidence_score=0.95, raw_payload=k_res["raw_payload"]
                 ), db)
-                st.error("🚨 SQL Injection Payload Detected & Blocked by Middleware!")
-            elif p_in != "kakarot_ultra_secret_123":
-                bf_res = track_brute_force("185.220.101.45", u_in)
-                st.warning(f"❌ Invalid Password! Failed attempt counter: {bf_res.get('attempts', 5)}/5")
-                if bf_res["triggered"]:
-                    record_and_correlate_alert(TelemetryEvent(
-                        source_ip="185.220.101.45",
-                        module_name=bf_res["module_name"],
-                        threat_type=bf_res["threat_type"],
-                        severity=bf_res["severity"],
-                        base_risk_score=bf_res["base_risk_score"],
-                        confidence_score=bf_res["confidence_score"],
-                        raw_payload=bf_res["raw_payload"]
-                    ), db)
+                st.error(f"🚨 Keystroke Anomaly Triggered! Z-Score: {k_res['z_score']}")
             else:
-                # Parse Location
-                if "London" in loc_choice:
-                    ip, city, country, lat, lon = "185.220.101.45", "London", "UK", 51.5074, -0.1278
-                elif "Pyongyang" in loc_choice:
-                    ip, city, country, lat, lon = "45.155.205.233", "Pyongyang", "North Korea", 39.0392, 125.7625
+                k_res = analyze_keystroke_biometrics([84, 86, 85], [118, 122, 120])
+                st.success(f"✅ Biometric Rhythm Matched! Z-Score: {k_res['z_score']}")
+            st.json(k_res["telemetry"])
+
+    with col_cam:
+        st.subheader("📸 Live Camera Threat & Multi-Person Detector")
+        st.caption("Analyzes: Single Operator (Safe) vs. Multiple Persons (Shoulder-Surfing) vs. Covered Lens vs. Absent User.")
+        live_cam = st.camera_input("Capture Frame for Live Threat Analysis")
+        if live_cam is not None:
+            c_res = verify_webcam_face_bytes(live_cam.getvalue())
+            for note in c_res["notifications"]:
+                if "THREAT" in note or "ALERT" in note:
+                    st.error(note)
                 else:
-                    ip, city, country, lat, lon = "103.21.125.10", "Pune", "India", 18.5204, 73.8567
-
-                geo_res = calculate_haversine_velocity(18.5204, 73.8567, lat, lon, 0.25)
-                current_session.city, current_session.country = city, country
-                current_session.latitude, current_session.longitude = lat, lon
-                current_session.geo_velocity_kmh = geo_res["velocity_kmh"]
-                current_session.source_ip = ip
-                db.commit()
-
-                if geo_res["triggered"]:
-                    record_and_correlate_alert(TelemetryEvent(
-                        source_ip=ip, module_name=geo_res["module_name"],
-                        threat_type=geo_res["threat_type"], severity=geo_res["severity"],
-                        base_risk_score=geo_res["base_risk_score"], confidence_score=geo_res["confidence_score"],
-                        raw_payload=geo_res["raw_payload"]
-                    ), db)
-
-                # Keystroke Check
-                dwells = [84, 86, 85, 83] if "Natural" in typing_style else [195, 205, 188, 210]
-                flights = [118, 122, 120, 119] if "Natural" in typing_style else [305, 320, 298, 315]
-                ks_res = analyze_keystroke_biometrics(dwells, flights)
-                if ks_res["triggered"]:
-                    record_and_correlate_alert(TelemetryEvent(
-                        source_ip=ip, module_name=ks_res["module_name"],
-                        threat_type=ks_res["threat_type"], severity=ks_res["severity"],
-                        base_risk_score=ks_res["base_risk_score"], confidence_score=ks_res["confidence_score"],
-                        raw_payload=ks_res["raw_payload"]
-                    ), db)
-                st.rerun()
-
-        # Keystroke Visual Comparison Chart
-        df_ks = pd.DataFrame({
-            "Metric": ["Dwell Time (ms)", "Flight Time (ms)"],
-            "Stored User Baseline": [85.0, 120.0],
-            "Current Login Attempt": [85.0, 120.0] if "Natural" in typing_style else [199.5, 309.5]
-        })
-        fig_ks = px.bar(df_ks, x="Metric", y=["Stored User Baseline", "Current Login Attempt"], barmode="group", height=240, title="Keystroke Dynamics Profile vs. Live Input")
-        st.plotly_chart(fig_ks, use_container_width=True)
-
-    with c_bio:
-        st.markdown("#### 2. Live OpenCV Webcam Face Verification (Module 8)")
-        st.info("Take a live snapshot below to verify a real human face using OpenCV Haar Cascades (unlocks Step-Up Auth).")
-        cam_photo = st.camera_input("Capture Live Biometric Frame")
-        if cam_photo is not None:
-            face_res = verify_webcam_face_bytes(cam_photo.getvalue())
-            if face_res["triggered"]:
+                    st.success(note)
+            st.json(c_res["telemetry"])
+            if c_res["triggered"]:
                 record_and_correlate_alert(TelemetryEvent(
-                    source_ip=current_session.source_ip,
-                    module_name=face_res["module_name"],
-                    threat_type=face_res["threat_type"],
-                    severity=face_res["severity"],
-                    base_risk_score=face_res["base_risk_score"],
-                    confidence_score=face_res["confidence_score"],
-                    raw_payload=face_res["raw_payload"]
+                    source_ip=current_session.source_ip, module_name="FACE_VERIFICATION",
+                    threat_type=c_res["threat_type"], severity="HIGH",
+                    base_risk_score=c_res["base_risk_score"], confidence_score=0.95,
+                    raw_payload=c_res["raw_payload"]
                 ), db)
-                st.error("🚨 OpenCV Detected 0 Live Faces! Biometric Step-Up Failed (+45 Risk).")
-            else:
-                st.success(f"✅ OpenCV Verified {face_res['faces_detected']} Live Human Face(s)! Step-Up Passed.")
-                if current_session.session_risk_score >= 40:
-                    current_session.session_risk_score = 15.0
-                    current_session.session_status = "ACTIVE"
-                    db.commit()
 
-# ------------------------------------------
-# TAB 3: NETWORK, MALWARE HASH & AI VISHING
-# ------------------------------------------
+# ------------------------------------------------------------------------------
+# TAB 5: PURE FFT AI VOICE REC (RANDOM SPEECH) & 1-CLICK MALWARE GENERATOR
+# ------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# TAB 5: PURE FFT AI VOICE REC (RANDOM SPEECH) & 1-CLICK BINARY .EXE GENERATOR
+# ------------------------------------------------------------------------------
 with tab3:
-    col_file, col_vish = st.columns(2)
+    st.markdown("### 🛠️ Step 1: 1-Click Safe Binary Malware & Audio Generator")
+    if st.button("✨ Click Here to Auto-Create Binary .EXE Malware & Speech Audio Files in Project Folder", use_container_width=True):
+        # 1. Create a REAL Binary PE Executable (.exe) with MZ headers & raw machine bytes (Not plain text!)
+        mal_path = os.path.join(ROOT_DIR, "ransomware_dropper_sim.exe")
+        pe_header = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00\xb8\x00\x00\x00\x00\x00\x00\x00"
+        dos_stub = b"\x0e\x1f\xba\x0e\x00\xb4\x09\xcd\x21\xb8\x01\x4c\xcd\x21This program cannot be run in DOS mode.\r\r\n$"
+        pe_sections = b"PE\x00\x00\x4c\x01\x03\x00.text\x00\x00\x00.data\x00\x00\x00"
+        compiled_payload = b"\x55\x89\xe5\x83\xec\x18\xc7\x04\x24\x90\x90\xcc\xeb\xfe\xde\xad\xbe\xef" * 120
+        
+        mal_bytes = pe_header + b"\x00" * 40 + dos_stub + b"\x00" * 64 + pe_sections + compiled_payload
+        
+        with open(mal_path, "wb") as f:
+            f.write(mal_bytes)
+            
+        mal_sha = compute_file_sha256(mal_bytes)
+        
+        # Register the binary's SHA-256 hash in the database (without confidence_level error!)
+        if not db.query(ThreatIndicator).filter_by(indicator_value=mal_sha).first():
+            db.add(ThreatIndicator(
+                indicator_type="SHA256",
+                indicator_value=mal_sha,
+                threat_actor="Ransomware.LockBit.BinaryDropper",
+                reputation_score=99
+            ))
+            db.commit()
 
-    with col_file:
-        st.subheader("🦠 Module 9: SHA-256 Malware File Scanner")
-        st.write("Upload any file to compute its SHA-256 fingerprint and check against `threat_indicators`. *(Note: Uploading an empty 0-byte file matches our seeded `Ransomware.LockBit.Dropper` SHA-256 hash `e3b0c44...`!)*")
-        up_file = st.file_uploader("Drop File to Scan", type=None)
-        if up_file is not None:
-            f_bytes = up_file.getvalue()
-            sha_val = compute_file_sha256(f_bytes)
-            st.code(f"Computed SHA-256: {sha_val}")
-            matched = db.query(ThreatIndicator).filter_by(indicator_value=sha_val).first()
-            if matched:
-                q_file = os.path.join(ROOT_DIR, "quarantine", f"QUARANTINED_{up_file.name}")
-                with open(q_file, "wb") as f:
-                    f.write(f_bytes)
-                record_and_correlate_alert(TelemetryEvent(
-                    source_ip=current_session.source_ip,
-                    indicator_value=sha_val,
-                    module_name="MALWARE_HASH",
-                    threat_type=f"Malware Hash Match ({matched.threat_actor})",
-                    severity="CRITICAL",
-                    base_risk_score=60.0,
-                    confidence_score=1.0,
-                    raw_payload=f"File {up_file.name} matched IOC {matched.threat_actor}. Quarantined."
-                ), db)
-                st.error(f"🚨 CRITICAL MALWARE DETECTED: `{matched.threat_actor}`! File isolated in `/quarantine`.")
-            else:
-                st.success("✅ File SHA-256 Hash is Clean (0 matches in Threat Intelligence DB).")
+        # 2. Create AI Robotic Speech WAV (Simulating AI voice clone)
+        ai_wav_path = os.path.join(ROOT_DIR, "ai_clone_random_speech.wav")
+        sr = 16000
+        with wave.open(ai_wav_path, "w") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
+            for i in range(sr * 3):
+                t = i / sr
+                env = 0.6 + 0.4 * math.sin(2 * math.pi * 4.0 * t)
+                sig = env * (0.5 * math.sin(2 * math.pi * 175 * t) + 0.3 * math.sin(2 * math.pi * 350 * t) + 0.2 * math.sin(2 * math.pi * 700 * t))
+                wf.writeframesraw(struct.pack("<h", int(sig * 16000)))
 
-    with col_vish:
-        st.subheader("📞 Module 10: AI Vishing (Voice Phishing) Analyzer")
-        default_scam = "Urgent call from bank support: Your KYC blocked and account suspended. Please share your OTP and CVV number or install AnyDesk for remote access immediately."
-        vish_input = st.text_area("Transcribed Support Call / Voicemail Audio Text", value=default_scam, height=120)
-        if st.button("🔍 Scan Call Transcript for Social Engineering", use_container_width=True):
-            v_res = analyze_vishing_transcript(vish_input)
+        # 3. Create Natural Human Speech WAV (Simulating real human voice with pitch jitter)
+        hum_wav_path = os.path.join(ROOT_DIR, "human_natural_random_speech.wav")
+        np.random.seed(42)
+        with wave.open(hum_wav_path, "w") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
+            phase = 0.0
+            for i in range(sr * 3):
+                t = i / sr
+                syllable_gate = 1.0 if math.sin(2 * math.pi * 2.5 * t) > -0.2 else 0.05
+                f0 = 140.0 + 45.0 * math.sin(2 * math.pi * 1.8 * t) + np.random.normal(0, 12.0)
+                phase += 2 * math.pi * f0 / sr
+                sig = syllable_gate * (0.6 * math.sin(phase) + 0.25 * np.random.normal(0, 0.5))
+                wf.writeframesraw(struct.pack("<h", int(max(-1.0, min(1.0, sig)) * 16000)))
+
+        st.success(f"✅ Created Binary & Audio files inside `{ROOT_DIR}`:\n"
+                   f"1. `ransomware_dropper_sim.exe` (Compiled PE Binary — SHA-256: `{mal_sha}`)\n"
+                   f"2. `ai_clone_random_speech.wav` (Triggers FFT AI Deepfake Alert)\n"
+                   f"3. `human_natural_random_speech.wav` (Passes as Natural Human Voice)")
+
+    st.markdown("---")
+    col_v, col_m = st.columns(2)
+
+    with col_v:
+        st.subheader("🎙️ Pure FFT AI Voice Deepfake Detector (No Keywords!)")
+        st.caption("Uses Fast Fourier Transform (`np.fft.rfft`) to measure Spectral Flatness, Centroid Frequency, and Pitch Jitter Variance on any random spoken audio.")
+        audio_up = st.file_uploader("Upload Any Spoken Audio (.wav)", type=["wav"])
+
+        if audio_up is not None:
+            a_bytes = audio_up.getvalue()
+            st.audio(a_bytes)
+            v_res = analyze_ai_voice_fft(a_bytes, audio_up.name)
+            st.json(v_res["telemetry"])
+
             if v_res["triggered"]:
                 record_and_correlate_alert(TelemetryEvent(
-                    source_ip="185.220.101.45",
-                    indicator_value="secure-bank-otp-verify.com",
-                    module_name=v_res["module_name"],
-                    threat_type=v_res["threat_type"],
-                    severity=v_res["severity"],
-                    base_risk_score=v_res["base_risk_score"],
-                    confidence_score=v_res["confidence_score"],
+                    source_ip="185.220.101.45", module_name="AI_VOICE_FFT",
+                    threat_type=v_res["threat_type"], severity="CRITICAL",
+                    base_risk_score=55.0, confidence_score=v_res["confidence_score"],
                     raw_payload=v_res["raw_payload"]
                 ), db)
-                st.error(f"🚨 VISHING SCAM DETECTED! Flagged High-Urgency Cues: `{v_res['matched_keywords']}`")
+                st.error(f"🚨 {v_res['threat_type']} — Verdict: `{v_res['telemetry']['verdict']}`")
             else:
-                st.success("✅ Call transcript appears benign.")
+                st.success(f"✅ Authentic Human Voice Verified! Verdict: `{v_res['telemetry']['verdict']}`")
 
-# ------------------------------------------
-# TAB 4: DBMS LIVE SQL EXPLORER
-# ------------------------------------------
+    with col_m:
+        st.subheader("🦠 SHA-256 Malware File Scanner")
+        st.caption("Select `demo_malware_payload.txt` from your project folder (created by the button above) or any empty `.txt` file!")
+        mal_up = st.file_uploader("Upload File for SHA-256 Inspection", type=None)
+        if mal_up is not None:
+            f_bytes = mal_up.getvalue()
+            sha_val = compute_file_sha256(f_bytes)
+            st.code(f"File: {mal_up.name}\nSHA-256: {sha_val}")
+            matched = db.query(ThreatIndicator).filter_by(indicator_value=sha_val).first()
+            if matched:
+                q_path = os.path.join(ROOT_DIR, "quarantine", f"QUARANTINED_{mal_up.name}")
+                with open(q_path, "wb") as f:
+                    f.write(f_bytes)
+                record_and_correlate_alert(TelemetryEvent(
+                    source_ip=current_session.source_ip, indicator_value=sha_val,
+                    module_name="MALWARE_HASH", threat_type=f"Malware SHA-256 Match ({matched.threat_actor})",
+                    severity="CRITICAL", base_risk_score=60.0, confidence_score=1.0,
+                    raw_payload=json.dumps({"filename": mal_up.name, "sha256": sha_val, "threat_actor": matched.threat_actor, "quarantine_path": q_path})
+                ), db)
+                st.error(f"🚨 MALWARE DETECTED: `{matched.threat_actor}`! Quarantined to `{q_path}`.")
+            else:
+                st.success("✅ SHA-256 Hash Clean.")
+
+# ------------------------------------------------------------------------------
+# TAB 6: DBMS LIVE SQL EXPLORER
+# ------------------------------------------------------------------------------
 with tab4:
-    st.subheader("🗄️ Database Management System (DBMS) Live Inspector")
-    st.caption("Demonstrates Relational Schema, Foreign Key JOINs, Indexed IOC Lookups, and SQL Views for Evaluation")
-
-    v1, v2 = st.columns(2)
-    with v1:
-        st.markdown("##### 📊 SQL View 1: `vw_high_risk_users`")
+    st.subheader("🗄️ Database Management System (DBMS) Live Explorer")
+    c_v1, c_v2 = st.columns(2)
+    with c_v1:
+        st.markdown("**SQL View: `vw_high_risk_users`**")
         st.dataframe(run_sql_df("SELECT * FROM vw_high_risk_users"), use_container_width=True, hide_index=True)
-    with v2:
-        st.markdown("##### 📈 SQL View 2: `vw_threat_module_summary`")
+    with c_v2:
+        st.markdown("**SQL View: `vw_threat_module_summary`**")
         st.dataframe(run_sql_df("SELECT * FROM vw_threat_module_summary"), use_container_width=True, hide_index=True)
 
-    st.markdown("##### 🔗 Relational Threat Intelligence IOC Table (`threat_indicators`)")
-    st.dataframe(run_sql_df("SELECT * FROM threat_indicators"), use_container_width=True, hide_index=True)
-
-    st.markdown("##### 🛡️ Automated SOAR Audit Trail (`incident_response_audit`)")
+    st.markdown("**Automated SOAR Audit Trail (`incident_response_audit`)**")
     st.dataframe(run_sql_df("SELECT * FROM incident_response_audit ORDER BY action_id DESC"), use_container_width=True, hide_index=True)
-
-    st.markdown("##### 💻 Run Custom Live SQL Query (For Examiner Q&A)")
-    custom_sql = st.text_area("SQL Query", value="SELECT a.alert_id, u.username, a.module_name, a.severity, t.threat_actor, a.base_risk_score, a.ioc_bonus_score FROM security_alerts a JOIN users u ON a.user_id = u.user_id LEFT JOIN threat_indicators t ON a.ioc_id = t.ioc_id ORDER BY a.alert_id DESC;")
-    if st.button("▶️ Execute SQL Query"):
-        try:
-            st.dataframe(run_sql_df(custom_sql), use_container_width=True, hide_index=True)
-        except Exception as e:
-            st.error(f"SQL Error: {e}")
 
 db.close()
